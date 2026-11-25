@@ -1561,6 +1561,7 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 
 /// Logs up to 24 distinct refused/misaligned buffer views in diagnostics builds.
 #[cfg(feature = "diagnostics")]
+#[allow(clippy::too_many_arguments)]
 fn note_refused_buffer(
     kind: &'static str,
     reason: &'static str,

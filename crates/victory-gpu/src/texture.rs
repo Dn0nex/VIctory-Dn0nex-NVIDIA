@@ -1042,7 +1042,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let mip_skip = u32::from(layout.desc.mips).saturating_sub(u32::from(d.MipLevels));
+    let mip_skip = layout.desc.mips.saturating_sub(u32::from(d.MipLevels));
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
