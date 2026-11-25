@@ -90,7 +90,7 @@ pub(crate) struct ResourceDesc {
     width: u64,
     height: u32,
     depth_or_array_size: u16,
-    mip_levels: u16,
+    pub(crate) mip_levels: u16,
     format: u32,
     sample_count: u32,
     sample_quality: u32,
@@ -357,9 +357,16 @@ pub(crate) struct Twin {
 #[cfg(windows)]
 impl Drop for Twin {
     fn drop(&mut self) {
-        TWINS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        TWINS[0].fetch_sub(1, Relaxed);
+        let bytes = self.colour.bytes + self.plane.as_ref().map_or(0, |p| p.bytes);
+        TWIN_BYTES.fetch_sub(bytes, Relaxed);
     }
 }
+
+/// Live bytes of depth twins (`colour` + optional `plane`).
+#[cfg(windows)]
+pub(crate) static TWIN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Colour twins alive, depth textures with unordered access left without
 /// one, and the copies recorded into depth textures and into twins since
@@ -562,8 +569,11 @@ fn twin_texture(
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
+    let colour = std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS));
+    let twin_bytes = colour.bytes + plane.as_ref().map_or(0, |p| p.bytes);
+    TWIN_BYTES.fetch_add(twin_bytes, Relaxed);
     Some(std::sync::Arc::new(Twin {
-        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        colour,
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
@@ -1659,6 +1669,29 @@ fn host_texture(
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // Skip mip 0 on large sampled-only block-compressed 2D textures to keep
+    // VRAM within 4 GB GPUs (`VICTORY_MIP_CLAMP=0` disables this).
+    static MIP_CLAMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mip_clamp = *MIP_CLAMP
+        .get_or_init(|| std::env::var_os("VICTORY_MIP_CLAMP").is_none_or(|v| v != "0"));
+    const TEXTURE2D: u32 = 3;
+    let is_bc = matches!(d.format, 70..=84 | 94..=99);
+    if mip_clamp
+        && d.dimension == TEXTURE2D
+        && d.flags == 0
+        && d.sample_count <= 1
+        && d.depth_or_array_size == 1
+        && d.mip_levels > 1
+        && d.width >= 1024
+        && d.height >= 8
+        && (d.width >> 1).is_multiple_of(4)
+        && (d.height >> 1).is_multiple_of(4)
+        && is_bc
+    {
+        d.width >>= 1;
+        d.height >>= 1;
+        d.mip_levels -= 1;
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).

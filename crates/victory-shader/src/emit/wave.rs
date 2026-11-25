@@ -34,6 +34,9 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// Low and high 32-bit halves of an `f64` sum reduction.
+    AddF64Lo,
+    AddF64Hi,
 }
 
 impl Op {
@@ -60,7 +63,9 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU | Op::AddF64Lo | Op::AddF64Hi => {
+                k == 0
+            }
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
@@ -72,7 +77,10 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+        matches!(
+            self,
+            Op::AddU | Op::AddF | Op::AddH | Op::Xor | Op::AddF64Lo | Op::AddF64Hi
+        )
     }
 }
 
@@ -299,6 +307,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            if name == "s_mov_b32"
+                && let Some(&Operand::Scalar { code: s, .. }) = src.first()
+                && let Some(v) = inst.read(Reg::S(s))
+                && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
+            {
+                let val = uni.get(&v).copied().unwrap_or(Sym::Uni(v));
+                uni.insert(w, val);
+                continue;
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
@@ -404,6 +421,61 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             _ => None,
         };
         let src = |k: usize| v.src.get(k).map(|o| lanes(o, &vec, &uni));
+        if name == "v_add_f64" && !modifiers {
+            let hi_of = |op: Option<&Operand>| -> Vec<Sym> {
+                let one = vec![Sym::Unknown; wave as usize];
+                match op {
+                    Some(&Operand::Vector { reg, .. }) => lanes(
+                        &Operand::Vector {
+                            reg: reg + 1,
+                            dwords: 1,
+                        },
+                        &vec,
+                        &uni,
+                    ),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => lanes(
+                        &Operand::Scalar {
+                            code: code + 1,
+                            dwords: 1,
+                        },
+                        &vec,
+                        &uni,
+                    ),
+                    _ => one,
+                }
+            };
+            let lo0 = src0.as_deref().unwrap_or(&[]);
+            let lo1 = src(1).unwrap_or_default();
+            let hi0 = hi_of(v.src.first());
+            let hi1 = hi_of(v.src.get(1));
+            let old_hi = lanes(
+                &Operand::Vector {
+                    reg: dreg + 1,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let res_lo: Vec<Sym> = (0..wave as usize)
+                .map(|l| match (lo0.get(l).copied(), lo1.get(l).copied()) {
+                    (Some(a), Some(b)) => combine(Op::AddF64Lo, a, b),
+                    _ => Sym::Unknown,
+                })
+                .collect();
+            let res_hi: Vec<Sym> = (0..wave as usize)
+                .map(|l| combine(Op::AddF64Hi, hi0[l], hi1[l]))
+                .collect();
+            let merge = |res: Vec<Sym>, old_v: Vec<Sym>| -> Vec<Sym> {
+                (0..wave as usize)
+                    .map(|l| if writes >> l & 1 != 0 { res[l] } else { old_v[l] })
+                    .collect()
+            };
+            vec.insert(dst, merge(res_lo, old));
+            if let Some(dst_hi) = inst.write(Reg::V(dreg + 1)) {
+                vec.insert(dst_hi, merge(res_hi, old_hi));
+            }
+            continue;
+        }
         let result: Vec<Sym> = match (name, fetched) {
             _ if modifiers => vec![Sym::Unknown; wave as usize],
             ("v_mov_b32", Some(a)) => a,

@@ -297,6 +297,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+std::thread_local! {
+    static WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with `VICTORY_WAVE_WIDE` enabled on this thread (for shaders known
+/// to widen safely without hanging the device).
+pub fn with_wave_wide<R>(f: impl FnOnce() -> R) -> R {
+    let was = WAVE_WIDE.replace(true);
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WAVE_WIDE.set(self.0);
+        }
+    }
+    let _reset = Reset(was);
+    f()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -379,7 +397,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

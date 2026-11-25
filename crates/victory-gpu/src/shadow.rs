@@ -1597,6 +1597,15 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+pub(crate) fn live_stats() -> [u64; 4] {
+    [
+        LIVE[0].load(Ordering::Relaxed),
+        LIVE[1].load(Ordering::Relaxed),
+        CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -1632,6 +1641,16 @@ pub(crate) fn memory() -> [u64; 6] {
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
+
+/// Relay piece-fetch telemetry: `[fetched_pieces, fetched_bytes, no_diff_pieces, no_merge_pieces, written_pieces, written_bytes, overwritten_pieces]`.
+pub(crate) static RELAY_PIECE_AUDIT: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+pub(crate) fn take_relay_piece_audit() -> [u64; 7] {
+    std::array::from_fn(|i| RELAY_PIECE_AUDIT[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+static RELAY_LAST_WRITTEN: Mutex<Option<std::collections::HashSet<(usize, usize)>>> = Mutex::new(None);
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
@@ -2599,6 +2618,9 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        RELAY_PIECE_AUDIT[0].fetch_add(1, Relaxed);
+        RELAY_PIECE_AUDIT[1].fetch_add(gpu.len() as u64, Relaxed);
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -2613,9 +2635,11 @@ impl Shadow {
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
+            RELAY_PIECE_AUDIT[2].fetch_add(1, Relaxed);
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
+        let piece_at = at;
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
@@ -2639,7 +2663,17 @@ impl Shadow {
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {
+            RELAY_PIECE_AUDIT[3].fetch_add(1, Relaxed);
             return 0;
+        }
+        RELAY_PIECE_AUDIT[4].fetch_add(1, Relaxed);
+        RELAY_PIECE_AUDIT[5].fetch_add(n as u64, Relaxed);
+        {
+            let mut set = RELAY_LAST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let set = set.get_or_insert_with(Default::default);
+            if !set.insert((start, piece_at)) {
+                RELAY_PIECE_AUDIT[6].fetch_add(1, Relaxed);
+            }
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);

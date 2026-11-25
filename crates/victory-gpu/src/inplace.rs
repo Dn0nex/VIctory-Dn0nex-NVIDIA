@@ -104,6 +104,15 @@ fn most() -> u64 {
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+pub(crate) fn live_stats() -> [u64; 4] {
+    [
+        STATS[0].load(Ordering::Relaxed),
+        STATS[1].load(Ordering::Relaxed),
+        STATS[2].load(Ordering::Relaxed),
+        STATS[3].load(Ordering::Relaxed),
+    ]
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,

@@ -89,10 +89,26 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Compute shaders verified to widen safely in 32-lane mode without hanging the GPU.
+const WAVE_WIDE_WHITELIST: &[&str] = &[
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+];
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(hash: &str, container: &[u8]) -> Result<HostShader, String> {
+    let wide = WAVE_WIDE_WHITELIST.contains(&hash);
+    let translate = |c: &[u8]| {
+        if wide {
+            victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(c))
+        } else {
+            victory_shader::emit::translate(c)
+        }
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

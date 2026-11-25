@@ -43,6 +43,8 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// Console mip levels skipped from the top (`layout.desc.mip_levels - mips`).
+    mip_skip: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -388,6 +390,11 @@ impl Drop for Staging {
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
     }
+}
+
+pub(crate) fn staged_stats() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed)]
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -792,9 +799,9 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.mip_skip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, mip = mip + self.mip_skip, slice, "texture not detiled");
                 return;
             }
         }
@@ -1035,6 +1042,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let mip_skip = u32::from(layout.desc.mips).saturating_sub(u32::from(d.MipLevels));
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1044,6 +1052,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_skip,
         bytes: total,
         memory,
         last: Mutex::default(),

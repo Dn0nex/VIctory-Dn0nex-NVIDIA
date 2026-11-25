@@ -1332,6 +1332,14 @@ impl<'a> Lower<'a> {
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
+                        } else if LOCAL_WAVES.get() && LOCAL_ANY.get() {
+                            // Last resort when every exact and barrier-safe form failed:
+                            // run each 32-lane host wave without inserting group barriers.
+                            wave = 32;
+                            if crosses {
+                                exchange = Some((s.lds_dwords, group <= 32, all));
+                                s.lds_dwords += 2 * group.div_ceil(64);
+                            }
                         }
                     }
                 }
@@ -1820,7 +1828,33 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        if op == Op::AddF64Lo {
+            return Ok(self.s.m.i32(0));
+        }
+        let x = if op == Op::AddF64Hi {
+            let hi = self.i32_of(src)?;
+            let k0 = self.s.m.i32(0);
+            let sign_mask = self.s.m.i32(0x8000_0000);
+            let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+            let k20 = self.s.m.i32(20);
+            let k7ff = self.s.m.i32(0x7ff);
+            let exp64 = self.s.m.bin(c, Bin::LShr, hi, k20);
+            let exp64 = self.s.m.bin(c, Bin::And, exp64, k7ff);
+            let k896 = self.s.m.i32(896);
+            let exp32 = self.s.m.bin(c, Bin::Sub, exp64, k896);
+            let k23 = self.s.m.i32(23);
+            let s_exp = self.s.m.bin(c, Bin::Shl, exp32, k23);
+            let kmant = self.s.m.i32(0x000f_ffff);
+            let mant_hi = self.s.m.bin(c, Bin::And, hi, kmant);
+            let k3 = self.s.m.i32(3);
+            let mant32 = self.s.m.bin(c, Bin::Shl, mant_hi, k3);
+            let body = self.s.m.bin(c, Bin::Or, s_exp, mant32);
+            let nz = self.s.m.cmp(c, pred::NE, exp64, k0);
+            let body = self.s.m.select(c, nz, body, k0);
+            self.s.m.bin(c, Bin::Or, sign, body)
+        } else {
+            self.i32_of(src)?
+        };
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
@@ -1830,13 +1864,13 @@ impl<'a> Lower<'a> {
                 None => self.half_sum(x),
             };
         }
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF | Op::AddF64Hi);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU | Op::AddF | Op::AddF64Hi, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
@@ -1865,7 +1899,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddF64Hi => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -1921,7 +1955,7 @@ impl<'a> Lower<'a> {
                     let (lo, hi) = self.exchange_halves(c, rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
-                        Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+                        Op::AddU | Op::AddF | Op::AddF64Hi => self.s.m.bin(c, Bin::Add, lo, hi),
                         Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
                         Op::And => self.s.m.bin(c, Bin::And, lo, hi),
                         Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
@@ -1943,6 +1977,29 @@ impl<'a> Lower<'a> {
         } else {
             r
         };
+        if op == Op::AddF64Hi {
+            let c = self.cur;
+            let b = self.as_int(r);
+            let k0 = self.s.m.i32(0);
+            let sign_mask = self.s.m.i32(0x8000_0000);
+            let sign = self.s.m.bin(c, Bin::And, b, sign_mask);
+            let k23 = self.s.m.i32(23);
+            let kff = self.s.m.i32(0xff);
+            let exp32 = self.s.m.bin(c, Bin::LShr, b, k23);
+            let exp32 = self.s.m.bin(c, Bin::And, exp32, kff);
+            let k896 = self.s.m.i32(896);
+            let exp64 = self.s.m.bin(c, Bin::Add, exp32, k896);
+            let k20 = self.s.m.i32(20);
+            let hi_exp = self.s.m.bin(c, Bin::Shl, exp64, k20);
+            let kmant = self.s.m.i32(0x7f_ffff);
+            let mant32 = self.s.m.bin(c, Bin::And, b, kmant);
+            let k3 = self.s.m.i32(3);
+            let hi_mant = self.s.m.bin(c, Bin::LShr, mant32, k3);
+            let hi = self.s.m.bin(c, Bin::Or, hi_exp, hi_mant);
+            let hi = self.s.m.bin(c, Bin::Or, sign, hi);
+            let nz = self.s.m.cmp(c, pred::NE, exp32, k0);
+            return Ok(self.s.m.select(c, nz, hi, k0));
+        }
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -5526,7 +5583,12 @@ impl<'a> Lower<'a> {
             x.res
                 .scalar
                 .iter()
-                .filter(|(s, b)| *s != site && *b == a && same(*s))
+                .filter(|(s, b)| {
+                    *s != site
+                        && (*b == a
+                            || (a.dynamic.is_some() && b.param == a.param && b.offset == a.offset))
+                        && same(*s)
+                })
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
@@ -5558,16 +5620,43 @@ impl<'a> Lower<'a> {
                 return Err("a sampler's descriptor read as data");
             }
             // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // the memory behind it (a ray-tracing structure) or checks its size:
+            // the address from the host, dword 2 from `getDimensions`, and
+            // other dwords have no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let stride = used.map_or(0, |u| u.stride);
+                let num_records = if count >= 3
+                    && let Ok(h) = self.handle(site, &src, false, (11 | u, 0))
+                {
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let undef = self.s.m.undef(i32t);
+                    let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, undef]);
+                    let n = self.s.m.extract(c, d, 0);
+                    if stride > 1 {
+                        let k = self.s.m.i32(stride);
+                        Some(self.s.m.bin(c, Bin::UDiv, n, k))
+                    } else {
+                        Some(n)
+                    }
+                } else {
+                    None
+                };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
                         0 => self.write(inst, reg, lo, None),
                         1 => self.write(inst, reg, hi, None),
+                        2 if num_records.is_some() => {
+                            self.write(inst, reg, num_records.unwrap(), None);
+                        }
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
@@ -7110,6 +7199,139 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let op = *v.src.first().ok_or("a missing operand")?;
+                let (lo, mut hi) = match op {
+                    Operand::Vector { reg, .. } => (
+                        self.i32_of(inst.read(Reg::V(reg)).ok_or("an unread operand")?)?,
+                        self.i32_of(inst.read(Reg::V(reg + 1)).ok_or("an unread operand")?)?,
+                    ),
+                    Operand::Scalar { code, .. } if code != NULL => (
+                        self.i32_of(inst.read(Reg::S(code)).ok_or("an unread operand")?)?,
+                        self.i32_of(inst.read(Reg::S(code + 1)).ok_or("an unread operand")?)?,
+                    ),
+                    Operand::Const(k) => {
+                        let bits = match k {
+                            128 => 0f64.to_bits(),
+                            240 => 0.5f64.to_bits(),
+                            241 => (-0.5f64).to_bits(),
+                            242 => 1.0f64.to_bits(),
+                            243 => (-1.0f64).to_bits(),
+                            244 => 2.0f64.to_bits(),
+                            245 => (-2.0f64).to_bits(),
+                            246 => 4.0f64.to_bits(),
+                            247 => (-4.0f64).to_bits(),
+                            248 => (1.0f64 / (2.0 * std::f64::consts::PI)).to_bits(),
+                            _ => return Err("an inline f64 constant"),
+                        };
+                        (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+                    }
+                    _ => return Err("an f64 operand"),
+                };
+                if v.abs & 1 != 0 {
+                    let mask = self.s.m.i32(0x7fff_ffff);
+                    hi = self.s.m.bin(c, Bin::And, hi, mask);
+                }
+                if v.neg & 1 != 0 {
+                    let sign_bit = self.s.m.i32(0x8000_0000);
+                    hi = self.s.m.bin(c, Bin::Xor, hi, sign_bit);
+                }
+                // IEEE-754 f64 (hi, lo) -> f32 bits in 32-bit integer arithmetic.
+                let sign_mask = self.s.m.i32(0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+                let k20 = self.s.m.i32(20);
+                let k7ff = self.s.m.i32(0x7ff);
+                let exp64 = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let exp64 = self.s.m.bin(c, Bin::And, exp64, k7ff);
+                let mant_mask = self.s.m.i32(0x000f_ffff);
+                let mant_hi = self.s.m.bin(c, Bin::And, hi, mant_mask);
+                let k3 = self.s.m.i32(3);
+                let k29 = self.s.m.i32(29);
+                let m_hi = self.s.m.bin(c, Bin::Shl, mant_hi, k3);
+                let m_lo = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let mant32 = self.s.m.bin(c, Bin::Or, m_hi, m_lo);
+                let k28 = self.s.m.i32(28);
+                let k1 = self.s.m.i32(1);
+                let k0 = self.s.m.i32(0);
+                let round_bit = self.s.m.bin(c, Bin::LShr, lo, k28);
+                let round_bit = self.s.m.bin(c, Bin::And, round_bit, k1);
+                let sticky_mask = self.s.m.i32(0x0fff_ffff);
+                let sticky_bits = self.s.m.bin(c, Bin::And, lo, sticky_mask);
+                let sticky = self.s.m.cmp(c, pred::NE, sticky_bits, k0);
+                let lsb = self.s.m.bin(c, Bin::And, mant32, k1);
+                let odd = self.s.m.cmp(c, pred::NE, lsb, k0);
+                let tie_or_sticky = self.s.m.bin(c, Bin::Or, sticky, odd);
+                let do_round = self.s.m.cmp(c, pred::NE, round_bit, k0);
+                let rne = self.s.m.bin(c, Bin::And, do_round, tie_or_sticky);
+                let rne_i = self.s.m.select(c, rne, k1, k0);
+
+                let k896 = self.s.m.i32(896);
+                let exp32 = self.s.m.bin(c, Bin::Sub, exp64, k896);
+                let k23 = self.s.m.i32(23);
+                let shifted_exp = self.s.m.bin(c, Bin::Shl, exp32, k23);
+                let norm = self.s.m.bin(c, Bin::Or, shifted_exp, mant32);
+                let norm = self.s.m.bin(c, Bin::Add, norm, rne_i);
+
+                let k255 = self.s.m.i32(255);
+                let inf_bits = self.s.m.i32(0x7f80_0000);
+                let nan_bits = self.s.m.i32(0x7fc0_0000);
+                let is_ovf = self.s.m.cmp(c, pred::SGE, exp32, k255);
+                let is_udf = self.s.m.cmp(c, pred::SLE, exp32, k0);
+                let body = self.s.m.select(c, is_ovf, inf_bits, norm);
+                let body = self.s.m.select(c, is_udf, k0, body);
+
+                let is_inf_nan = self.s.m.cmp(c, pred::EQ, exp64, k7ff);
+                let mant_any = self.s.m.bin(c, Bin::Or, mant_hi, lo);
+                let is_nan = self.s.m.cmp(c, pred::NE, mant_any, k0);
+                let inf_nan = self.s.m.select(c, is_nan, nan_bits, inf_bits);
+                let body = self.s.m.select(c, is_inf_nan, inf_nan, body);
+
+                let is_zero = self.s.m.cmp(c, pred::EQ, exp64, k0);
+                let body = self.s.m.select(c, is_zero, k0, body);
+                let bits = self.s.m.bin(c, Bin::Or, sign, body);
+                let f = self.as_float(bits);
+                float(self, f)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Both stay within the 32-lane half, so they work on 32-lane host waves.
+                self.cross_lane(false)?;
+                let mut a = s(self, 0)?;
+                let s1 = s(self, 1)?;
+                let s2 = s(self, 2)?;
+                let fi = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
+                if !fi && !bound_ctrl && let Some(g) = guard {
+                    let z = self.s.m.i32(0);
+                    a = self.s.m.select(c, g, a, z);
+                }
+                let lane = self.lane_index();
+                let k0 = self.s.m.i32(0);
+                let k2 = self.s.m.i32(2);
+                let k7 = self.s.m.i32(7);
+                let k8 = self.s.m.i32(8);
+                let k15 = self.s.m.i32(15);
+                let in_hi8 = self.s.m.bin(c, Bin::And, lane, k8);
+                let is_hi8 = self.s.m.cmp(c, pred::NE, in_hi8, k0);
+                let word = self.s.m.select(c, is_hi8, s2, s1);
+                let nibble_idx = self.s.m.bin(c, Bin::And, lane, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble_idx, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let base = if name == "v_permlane16_b32" {
+                    let not15 = self.s.m.i32(!15);
+                    self.s.m.bin(c, Bin::And, lane, not15)
+                } else {
+                    let not31 = self.s.m.i32(!31);
+                    let k16 = self.s.m.i32(16);
+                    let half = self.s.m.bin(c, Bin::And, lane, not31);
+                    let row = self.s.m.bin(c, Bin::And, lane, k16);
+                    let other_row = self.s.m.bin(c, Bin::Xor, row, k16);
+                    self.s.m.bin(c, Bin::Or, half, other_row)
+                };
+                let src_lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_lane(a, src_lane);
+                int(self, r)
+            }
             "v_cndmask_b32" => {
                 let mask = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
@@ -7125,7 +7347,7 @@ impl<'a> Lower<'a> {
                     None if self.mask_data == MaskData::Console => {
                         // Each host wave taken as a wave of its own has no
                         // console lane numbers to pick the bits by.
-                        if self.local {
+                        if self.local && !self.local_any {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;

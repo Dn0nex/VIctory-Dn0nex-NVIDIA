@@ -1219,10 +1219,13 @@ impl<'a> Tracer<'a> {
         if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
             return None;
         }
+        let base = known.len();
+        known.push((lanes.reach[block], true));
         let mut only = None;
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
+            let mut possible = true;
             if let LaneExit::Branch {
                 when,
                 taken,
@@ -1230,17 +1233,28 @@ impl<'a> Tracer<'a> {
             } = lanes.exits[q]
                 && taken != not_taken
             {
-                known.push((when, taken == block));
+                if taken == block
+                    && self.p.blocks[q]
+                        .insts
+                        .last()
+                        .is_some_and(|i| i.name() == "s_cbranch_execz")
+                {
+                    possible = false;
+                } else {
+                    known.push((when, taken == block));
+                }
             }
-            let possible = self.meet(lanes, known);
+            let possible = possible && self.meet(lanes, known);
             known.truncate(n);
             if possible {
                 if only.is_some() {
+                    known.truncate(base);
                     return None;
                 }
                 only = Some(j);
             }
         }
+        known.truncate(base);
         only
     }
 

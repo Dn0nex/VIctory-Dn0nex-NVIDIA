@@ -300,14 +300,48 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+/// Lightweight always-on watch telemetry:
+/// `[watch_calls, watch_bytes, watch_us, guard_calls, guard_bytes, guard_us, thread_mask]`.
+static WATCH_AUDIT: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static WATCH_NEXT_THREAD_BIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn record_watch_thread() {
+    std::thread_local! {
+        static BIT: u64 = {
+            let idx = WATCH_NEXT_THREAD_BIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            1u64 << (idx % 64)
+        };
+    }
+    BIT.with(|&b| {
+        WATCH_AUDIT[6].fetch_or(b, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn take_watch_audit() -> [u64; 7] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = [0u64; 7];
+    for (i, slot) in WATCH_AUDIT.iter().enumerate() {
+        out[i] = slot.swap(0, Relaxed);
+    }
+    out[6] = u64::from(out[6].count_ones());
+    out
+}
+
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let span_bytes = ((last - first) * PAGE) as u64;
+    record_watch_thread();
+    let watch_started = std::time::Instant::now();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        WATCH_AUDIT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WATCH_AUDIT[1].fetch_add(span_bytes, std::sync::atomic::Ordering::Relaxed);
+        WATCH_AUDIT[2].fetch_add(watch_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         return Some((
             j.ahead_asked,
             j.written
@@ -319,7 +353,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -337,21 +370,28 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if !guarded {
             return None;
         }
-        #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
+        let guard_us = guarding.elapsed().as_micros() as u64;
+        WATCH_AUDIT[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WATCH_AUDIT[4].fetch_add(span_bytes, std::sync::atomic::Ordering::Relaxed);
+        WATCH_AUDIT[5].fetch_add(guard_us, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::GuardUs, guard_us);
         written?
     } else {
         Vec::new()
     };
+    let watch_us = started.elapsed().as_micros() as u64;
+    WATCH_AUDIT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WATCH_AUDIT[1].fetch_add(span_bytes, std::sync::atomic::Ordering::Relaxed);
+    WATCH_AUDIT[2].fetch_add(watch_us, std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
+        add(C::WatchUs, watch_us);
+        slow(watch_us);
     }
     j.asked += 1;
     let now = j.asked;

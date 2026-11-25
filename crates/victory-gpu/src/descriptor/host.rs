@@ -1559,6 +1559,47 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// Logs up to 24 distinct refused/misaligned buffer views in diagnostics builds.
+#[cfg(feature = "diagnostics")]
+fn note_refused_buffer(
+    kind: &'static str,
+    reason: &'static str,
+    format: i32,
+    offset: u64,
+    element: u64,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+    len: u64,
+) {
+    static SEEN: Mutex<Vec<(&'static str, &'static str, i32, u64, u64, u32, u32, bool)>> =
+        Mutex::new(Vec::new());
+    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let key = (kind, reason, format, offset % 16, element, count.min(1), stride, raw);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 24 && !seen.contains(&key) {
+        seen.push(key);
+        tracing::warn!(
+            total = n,
+            kind,
+            reason,
+            format,
+            offset,
+            element,
+            first,
+            count,
+            stride,
+            raw,
+            width,
+            len,
+            "audit refused buffer view"
+        );
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -1587,6 +1628,20 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
+            #[cfg(feature = "diagnostics")]
+            note_refused_buffer(
+                "srv",
+                "misaligned",
+                desc.Format.0,
+                offset,
+                element,
+                buffer.FirstElement,
+                buffer.NumElements,
+                buffer.StructureByteStride,
+                buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
+                0,
+                len,
+            );
             once!(
                 offset,
                 element,
@@ -1602,6 +1657,8 @@ fn buffer_srv(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_refused_buffer("srv", "view_ok", desc.Format.0, offset, element, first, count, stride, raw, width, len);
         once!(
             format = desc.Format.0,
             first,
@@ -1665,6 +1722,20 @@ fn buffer_uav(
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
         if element == 0 || offset % element != 0 {
+            #[cfg(feature = "diagnostics")]
+            note_refused_buffer(
+                "uav",
+                "misaligned",
+                desc.Format.0,
+                offset,
+                element,
+                buffer.FirstElement,
+                buffer.NumElements,
+                buffer.StructureByteStride,
+                buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
+                0,
+                len,
+            );
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
@@ -1682,6 +1753,8 @@ fn buffer_uav(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_refused_buffer("srv", "view_ok", desc.Format.0, offset, element, first, count, stride, raw, width, len);
         once!(
             format = desc.Format.0,
             first,
@@ -1885,6 +1958,21 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(srv) = desc.as_mut()
+                    && srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+                {
+                    // SAFETY: a live resource.
+                    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    // SAFETY: `ViewDimension` is `TEXTURE2D`.
+                    let t2d = unsafe { &mut srv.Anonymous.Texture2D };
+                    if t2d.MostDetailedMip >= host_mips {
+                        t2d.MostDetailedMip = host_mips.saturating_sub(1);
+                    }
+                    let avail = host_mips.saturating_sub(t2d.MostDetailedMip);
+                    if t2d.MipLevels != u32::MAX && t2d.MipLevels > avail {
+                        t2d.MipLevels = avail;
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -2158,8 +2246,63 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// A texture view that reads zeros with the dimension (and mip and array
-/// counts) of the title's description `words`; 2D if it names none.
+/// A 1x1 opaque `R8G8B8A8_UNORM` dummy texture `(64, 64, 64, 255)` for unmapped
+/// 2D texture slots (`VICTORY_OPAQUE_NULL=0` keeps them reading zeros).
+fn opaque_dummy_2d() -> Option<&'static ID3D12Resource> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_OPAQUE_NULL").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    static DUMMY: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    DUMMY
+        .get_or_init(|| {
+            let host = host()?;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            // SAFETY: plain 1x1 texture creation on a CPU-writable heap.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut tex,
+                    )
+                    .ok()?;
+            }
+            let tex = tex?;
+            let pixel: [u8; 4] = [64, 64, 64, 255];
+            // SAFETY: 1x1 RGBA8 subresource 0 matches `pixel`.
+            unsafe {
+                tex.WriteToSubresource(0, None, pixel.as_ptr().cast(), 4, 4)
+                    .ok()?;
+            }
+            Some(tex)
+        })
+        .as_ref()
+}
+
+/// A texture view that reads zeros (or an opaque 1x1 dummy for 2D textures)
+/// with the dimension (and mip and array counts) of the title's description
+/// `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
@@ -2178,10 +2321,15 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let mut desc = srv_desc(&w);
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    let dummy = if desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+        opaque_dummy_2d()
+    } else {
+        None
+    };
+    // SAFETY: a slot of our heap; `dummy` (if any) or a null resource is allowed with a desc.
     unsafe {
         host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+            .CreateShaderResourceView(dummy, Some(&desc), at)
     };
 }
 

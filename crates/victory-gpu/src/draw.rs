@@ -175,6 +175,7 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    depth_bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -601,6 +602,11 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        crate::draw::depth_bounds(list, min, max);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -636,6 +642,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some((min, max)) = self.depth_bounds {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
 
@@ -1311,7 +1320,15 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static FULL_PASS_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let full_every = *FULL_PASS_EVERY.get_or_init(|| {
+            std::env::var("VICTORY_MIRROR_FULL_PASS_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(16)
+                .max(1)
+        });
+        let slots = if *passes % full_every == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1445,8 +1462,15 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        /// Bytes of texture memory staged per frame (`VICTORY_TEXTURE_PER_FRAME_MB`, default 192).
+        static PER_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let per_frame = *PER_FRAME.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_PER_FRAME_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(192)
+                << 20
+        });
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1499,10 +1523,17 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_TEXTURE_SPAN_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(250);
+            std::time::Duration::from_millis(ms)
+        });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2689,4 +2720,20 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    use windows::core::Interface;
+    if min.is_nan() || max.is_nan() {
+        return;
+    }
+    let min = min.clamp(0.0, 1.0);
+    let max = max.clamp(0.0, 1.0);
+    if min > max {
+        return;
+    }
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list with `0.0 <= min <= max <= 1.0`.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
 }

@@ -369,6 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves: Vec<(Site, Attribute, Value)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +383,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => {
+                            if let Operand::Vector { reg: d, .. } = *dst
+                                && let Some(v) = inst.write(Reg::V(d))
+                            {
+                                first_halves.push((site, attribute, v));
+                            }
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +409,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        let attr = attribute(inst, &v.src[0])?;
+                        if let Some(Operand::Vector { reg: d, .. }) = v.dst
+                            && let Some(val) = inst.write(Reg::V(d))
+                        {
+                            first_halves.push((site, attr, val));
+                        }
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -457,6 +471,28 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     });
                 }
                 _ => {}
+            }
+        }
+    }
+    if !first_halves.is_empty() {
+        let mut non_p2_readers = std::collections::HashSet::new();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    non_p2_readers.insert(a);
+                }
+            }
+            for inst in &block.insts {
+                if !matches!(inst.name(), "v_interp_p2_f32" | "v_interp_p2_f16") {
+                    for &(_, v) in &inst.reads {
+                        non_p2_readers.insert(v);
+                    }
+                }
+            }
+        }
+        for (site, attribute, v) in first_halves {
+            if non_p2_readers.contains(&v) && !io.interps.iter().any(|(s, _)| *s == site) {
+                io.interps.push((site, Interp::Weighted { attribute }));
             }
         }
     }

@@ -867,7 +867,45 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            let (d_to, d_from) = unsafe { (to.GetDesc(), from.GetDesc()) };
+            if d_to.Width == d_from.Width
+                && d_to.Height == d_from.Height
+                && d_to.DepthOrArraySize == d_from.DepthOrArraySize
+                && d_to.MipLevels == d_from.MipLevels
+            {
+                unsafe { list.list.CopyResource(to, from) };
+            } else {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+                    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                };
+                let skip_to = mip_skip(dst, to);
+                let skip_from = mip_skip(src, from);
+                let c_to = u32::from(d_to.MipLevels) + skip_to;
+                let c_from = u32::from(d_from.MipLevels) + skip_from;
+                let slices = u32::from(d_to.DepthOrArraySize).min(u32::from(d_from.DepthOrArraySize));
+                let common_mips = c_to.min(c_from);
+                let start_mip = skip_to.max(skip_from);
+                for slice in 0..slices {
+                    for mip in start_mip..common_mips {
+                        let dst_sub = slice * u32::from(d_to.MipLevels) + (mip - skip_to);
+                        let src_sub = slice * u32::from(d_from.MipLevels) + (mip - skip_from);
+                        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::ManuallyDrop::new(Some(to.clone())),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: dst_sub },
+                        };
+                        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::ManuallyDrop::new(Some(from.clone())),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: src_sub },
+                        };
+                        unsafe { list.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None) };
+                        std::mem::ManuallyDrop::into_inner(dst_loc.pResource);
+                        std::mem::ManuallyDrop::into_inner(src_loc.pResource);
+                    }
+                }
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -959,6 +997,7 @@ extern "system" fn copy_texture_region(
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        let mut src_texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
@@ -990,6 +1029,7 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            src_texture = Some(texture.clone());
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
@@ -998,6 +1038,14 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if !adjust_subresource(dst.resource, to, &mut to_location) {
+            return;
+        }
+        if let Some(src_tex) = &src_texture
+            && !adjust_subresource(src.resource, src_tex, &mut from)
+        {
+            return;
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
@@ -1043,6 +1091,43 @@ extern "system" fn copy_texture_region(
 /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
 /// into `list`, or says why not.
 #[cfg(windows)]
+#[cfg(windows)]
+fn mip_skip(title_res: This, host_res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    let Some((_, desc)) = crate::resource::texture_memory(title_res) else {
+        return 0;
+    };
+    // SAFETY: a live resource.
+    let host_mips = u32::from(unsafe { host_res.GetDesc() }.MipLevels);
+    u32::from(desc.mip_levels).saturating_sub(host_mips)
+}
+
+#[cfg(windows)]
+fn adjust_subresource(
+    title_res: This,
+    host_res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    loc: &mut CopyLocation,
+) -> bool {
+    const FOOTPRINT: u32 = 1;
+    if loc.kind == FOOTPRINT {
+        return true;
+    }
+    let skip = mip_skip(title_res, host_res);
+    if skip == 0 {
+        return true;
+    }
+    // SAFETY: a live resource.
+    let host_mips = u32::from(unsafe { host_res.GetDesc() }.MipLevels);
+    let console_mips = host_mips + skip;
+    let sub = loc.footprint.offset as u32;
+    let mip = sub % console_mips;
+    if mip < skip {
+        return false;
+    }
+    let slice = sub / console_mips;
+    loc.footprint.offset = u64::from(slice * host_mips + (mip - skip));
+    true
+}
+
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 fn read_back(
     list: &crate::host::HostList,
@@ -1081,6 +1166,9 @@ fn read_back(
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
+    if !adjust_subresource(src.resource, texture, &mut from) {
+        return Ok(());
+    }
     from.resource = texture.as_raw().cast_const().cast();
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
@@ -1434,14 +1522,8 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 extern "system" fn ignored_state(_: This) {}
 
 /// Depth bounds `(min, max)`.
-/// shortcut: not set on the host list (no host pipeline of ours enables
-/// the test, `pipeline::host`); the first values are logged, so a run
-/// shows whether the title uses the test at all.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-        tracing::info!(min, max, "the title sets depth bounds, which the host is not given");
-    }
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
 }
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or

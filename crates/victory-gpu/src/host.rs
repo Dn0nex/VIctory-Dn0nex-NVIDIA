@@ -2506,6 +2506,18 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        let a = crate::shadow::take_relay_piece_audit();
+        tracing::info!(
+            "relay piece audit per frame: {:.1} fetched ({:.1} MB), {:.1} identical to held (no_diff), {:.1} no merge change, \
+             {:.1} written to title ({:.2} MB), {:.1} overwritten again by GPU",
+            a[0] as f64 / frames,
+            a[1] as f64 / (1 << 20) as f64 / frames,
+            a[2] as f64 / frames,
+            a[3] as f64 / frames,
+            a[4] as f64 / frames,
+            a[5] as f64 / (1 << 20) as f64 / frames,
+            a[6] as f64 / frames,
+        );
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
@@ -5296,6 +5308,32 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+static COPY_MAPPED_AUDIT: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static COPY_MAPPED_NEXT_THREAD_BIT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn record_copy_mapped_thread() {
+    std::thread_local! {
+        static BIT: u64 = {
+            let idx = COPY_MAPPED_NEXT_THREAD_BIT.fetch_add(1, Ordering::Relaxed);
+            1u64 << (idx % 64)
+        };
+    }
+    BIT.with(|&b| {
+        COPY_MAPPED_AUDIT[6].fetch_or(b, Ordering::Relaxed);
+    });
+}
+
+fn take_copy_mapped_audit() -> [u64; 7] {
+    let mut out = [0u64; 7];
+    for (i, slot) in COPY_MAPPED_AUDIT.iter().enumerate() {
+        out[i] = slot.swap(0, Ordering::Relaxed);
+    }
+    out[6] = u64::from(out[6].count_ones());
+    out
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -5327,9 +5365,16 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    record_copy_mapped_thread();
+    let copy_started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
+    let copy_us = copy_started.elapsed().as_micros() as u64;
+    let base = if title_dst { 3 } else { 0 };
+    COPY_MAPPED_AUDIT[base].fetch_add(1, Ordering::Relaxed);
+    COPY_MAPPED_AUDIT[base + 1].fetch_add(len as u64, Ordering::Relaxed);
+    COPY_MAPPED_AUDIT[base + 2].fetch_add(copy_us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5493,6 +5538,9 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
+static READBACK_MADE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
@@ -5528,7 +5576,11 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                READBACK_MADE[0].fetch_add(1, Ordering::Relaxed);
+                READBACK_MADE[1].fetch_add(size.max(1), Ordering::Relaxed);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -5817,6 +5869,90 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            {
+                let vram = host().and_then(|h| h.video_memory()).unwrap_or_default();
+                let kinds = [0, 1, 2, 3, 4, 5, 6].map(|i| crate::resource::KINDS[i].load(Ordering::Relaxed));
+                let host_tex = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Ordering::Relaxed));
+                let twin_bytes = crate::resource::TWIN_BYTES.load(Ordering::Relaxed);
+                let rt_bytes = host_tex[1].saturating_sub(kinds[1]).saturating_sub(twin_bytes);
+                let staged = crate::texture::staged_stats();
+                let shadow = crate::shadow::live_stats();
+                let inplace = crate::inplace::live_stats();
+                let alive = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| ALIVE[i].load(Ordering::Relaxed));
+                let made = [0, 1, 2, 3, 4, 5].map(|i| MADE[i].load(Ordering::Relaxed));
+                let readback = [0, 1].map(|i| READBACK_MADE[i].load(Ordering::Relaxed));
+                let mib = |b: u64| b >> 20;
+                tracing::info!(
+                    "memory audit (live): dxgi local {} MiB (budget {}), shared {} MiB (budget {}); \
+                     KINDS=[alive_filled:{} ({} MiB), let_go:{} ({} MiB), remade:{} ({} MiB), total_made:{}]; \
+                     host_textures={} ({} MiB: filled {} MiB, rt/depth/uav {} MiB, depth_twins {} MiB); \
+                     staging={} ({} MiB); shadow_shared_L0={} ({} MiB); card_buffers={} MiB (before {} MiB); \
+                     inplace_win={} ({} MiB), inplace_buf={} ({} MiB); \
+                     lists={} scratch_chunks={} ({} MiB, spare {} MiB) upload_alive={} ({} MiB); \
+                     made_since_start=[upload:{} ({} MiB), shared_L0:{} ({} MiB), card:{} ({} MiB), readback:{} ({} MiB)]",
+                    mib(vram[1]),
+                    mib(vram[0]),
+                    mib(vram[3]),
+                    mib(vram[2]),
+                    kinds[0],
+                    mib(kinds[1]),
+                    kinds[2],
+                    mib(kinds[3]),
+                    kinds[4],
+                    mib(kinds[5]),
+                    kinds[6],
+                    host_tex[0],
+                    mib(host_tex[1]),
+                    mib(kinds[1]),
+                    mib(rt_bytes),
+                    mib(twin_bytes),
+                    staged[0],
+                    mib(staged[1]),
+                    shadow[0],
+                    mib(shadow[1]),
+                    mib(shadow[2]),
+                    mib(shadow[3]),
+                    inplace[0],
+                    mib(inplace[1]),
+                    inplace[2],
+                    mib(inplace[3]),
+                    alive[0],
+                    alive[1],
+                    mib(alive[2]),
+                    mib(alive[4]),
+                    alive[6],
+                    mib(alive[7]),
+                    made[0],
+                    mib(made[1]),
+                    made[2],
+                    mib(made[3]),
+                    made[4],
+                    mib(made[5]),
+                    readback[0],
+                    mib(readback[1]),
+                );
+                let wa = crate::watch::take_watch_audit();
+                let cm = take_copy_mapped_audit();
+                tracing::info!(
+                    "watch & copy_mapped per frame: watch={:.1} calls {:.1} MiB {:.1} ms (threads={}, guard={:.1} calls {:.1} MiB {:.1} ms); \
+                     copy_mapped to_shadow(RAM->L0_WB ReadProcessMemory)={:.1} calls {:.1} MiB {:.1} ms, \
+                     to_title(L0/RB->RAM)={:.1} calls {:.1} MiB {:.1} ms (threads={})",
+                    wa[0] as f64 / frames,
+                    wa[1] as f64 / (1024.0 * 1024.0) / frames,
+                    wa[2] as f64 / 1000.0 / frames,
+                    wa[6],
+                    wa[3] as f64 / frames,
+                    wa[4] as f64 / (1024.0 * 1024.0) / frames,
+                    wa[5] as f64 / 1000.0 / frames,
+                    cm[0] as f64 / frames,
+                    cm[1] as f64 / (1024.0 * 1024.0) / frames,
+                    cm[2] as f64 / 1000.0 / frames,
+                    cm[3] as f64 / frames,
+                    cm[4] as f64 / (1024.0 * 1024.0) / frames,
+                    cm[5] as f64 / 1000.0 / frames,
+                    cm[6],
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
