@@ -76,16 +76,3 @@
 *.swp
 Thumbs.db
 .DS_Store
-
-.rust/
-
-# Local logs, shader dumps, and machine-specific launch scripts
-/logs/
-*.log
-*.cdxil
-/last_run_summary.md
-/JUGAR_VICTORY_GTA6.bat
-/run_fast.ps1
-/diag_run.ps1
-/benchmark_matrix.ps1
-/use_portable_rust.ps1

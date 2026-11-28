@@ -11,8 +11,14 @@ use std::path::{Component, Path, PathBuf};
 /// Marker file at the root of the source tree.
 pub const ROOT_MARKER: &str = ".victory-root";
 
-/// The source tree this binary was compiled from.
+/// The source tree this binary was compiled from. A build for others
+/// (`VICTORY_HIDE_BUILD_ROOT` set when compiling) does not carry the folder
+/// it was built in: an empty path, which the check skips; the marker check
+/// still finds any source tree.
 fn compiled_workspace_root() -> PathBuf {
+    if option_env!("VICTORY_HIDE_BUILD_ROOT").is_some() {
+        return PathBuf::new();
+    }
     // crates/victory-core -> workspace root
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
@@ -92,6 +98,11 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
                     rest.push(name.to_os_string());
                     existing = parent;
                 }
+                // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
+                (Some(parent), None) if existing.ends_with("..") => {
+                    rest.push("..".into());
+                    existing = parent;
+                }
                 _ => {
                     return Err(PolicyError::Io {
                         path: path.to_path_buf(),
@@ -155,5 +166,13 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn resolves_dot_dot_in_a_path_that_does_not_exist_yet() {
+        let base = std::env::temp_dir().join("victory-policy-no-such");
+        let path = base.join("a").join("..").join("b");
+        let resolved = resolve(&path).expect("a `..` in the missing tail must resolve lexically");
+        assert_eq!(resolved, resolve(&base.join("b")).unwrap());
     }
 }
