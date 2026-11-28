@@ -1,9 +1,12 @@
-# VIctory — 16 GB edition
+# VIctory (Dn0nex build)
 
 A build of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs an
-Xbox Series title natively on Windows (Direct3D 12) from files the user supplies, tuned for
-**ordinary PCs: 16 GB of RAM, an 8 GB graphics card and a 6-core CPU**, without lowering the
-picture: textures, shaders, resolution and ray tracing stay as they are.
+Xbox Series title natively on Windows (Direct3D 12) from files the user supplies. It runs on
+**any PC from 16 GB of RAM up** (more RAM, more cores and a stronger card only make it faster),
+and it was tuned so that even an ordinary PC (16 GB, an 8 GB card, 6 cores) can play it, without
+lowering the picture: textures, shaders, resolution and ray tracing stay as they are.
+
+**To play: put `victory.exe` in the folder of your game dump and double-click it.**
 
 > **This repository and its releases contain no game files, code or assets.**
 > You need your own dump of the game. This project is not affiliated with or endorsed by
@@ -23,7 +26,7 @@ It runs, but it is **not smooth yet**. Tested on one mid-range PC (6-core CPU, 8
 | Busy views | 6–7 fps |
 | Memory | stays inside 16 GB RAM / 8 GB VRAM |
 
-Faster PCs (more cores, 32 GB RAM, a stronger card) should do better: the launcher detects
+Faster PCs (more cores, 32 or 64 GB of RAM, a stronger card) do better: `victory.exe` detects
 the number of CPU threads and the amount of RAM and uses more threads and memory when there are.
 
 Known problems (from upstream and this build):
@@ -42,8 +45,11 @@ Known problems (from upstream and this build):
   ~0.4 MB. Walking went from ~6.5 to ~8–10 fps.
 - **Spare memory pools are trimmed only when idle**, instead of being freed and re-made every
   frame under memory pressure.
-- **A launcher profile for 16 GB / 8 GB**: windows of game memory kept on the card, finer
-  windows, card-side steps instead of waits, fewer threads on 6-core CPUs.
+- **Settings built in, chosen for the PC it runs on**: windows of game memory kept on the card,
+  finer windows, card-side steps instead of waits; fewer threads on 6-core CPUs, more on 8-core
+  ones, more memory used in place with 32 GB or more.
+- **Double-click start**: `victory.exe` with no arguments finds the game in its own folder and
+  starts it, no launcher needed.
 
 Everything else (the loader, the runtime, the D3D12 back end, the shader recompiler, the
 threaded translation, landings and card steps) comes from the projects in the credits.
@@ -54,26 +60,27 @@ threaded translation, landings and card steps) comes from the projects in the cr
 - A CPU with **AVX2** (Intel 4th gen / AMD Ryzen or newer); 6 cores or more
 - A Direct3D 12 card with **shader model 6.6 and mesh shaders** (NVIDIA RTX 20 series or newer,
   AMD RX 6000 or newer, Intel Arc), 8 GB of VRAM, an up-to-date driver
-- **16 GB of RAM minimum**, 32 GB recommended
+- **16 GB of RAM or more** (32 or 64 GB run better)
 - An SSD for the game files
 - **Your own complete dump of the game** (the folder with `game_scarlett_master.exe`)
 
 ## How to run it
 
-1. Download the ZIP from Releases and extract it anywhere.
-2. Tell the launcher where your dump is, either by putting it in a folder named `game` next to
-   `Play-VIctory.cmd`, or from a command prompt:
-   ```bat
-   set VICTORY_GAME_DIR=D:\MyDump
-   Play-VIctory.cmd
-   ```
-3. The first start takes a while (shader cache). The cache goes to
-   `%LOCALAPPDATA%\VIctory\cache` (`VICTORY_CACHE_DIR` changes it), and the log of each run to
-   `victory-run.log` next to the launcher.
+1. Download `victory.exe` from [Releases](../../releases/latest).
+2. Put it in the folder of your game dump, next to `game_scarlett_master.exe`.
+3. Double-click `victory.exe`.
+
+That is all. The first start takes a while (shaders are prepared and cached in
+`%LOCALAPPDATA%\victory\cache`); keep the console window open while you play. The log of each
+run goes to `victory-run.log` next to `victory.exe`.
 
 Windows SmartScreen or an antivirus may warn about `victory.exe`: it is not signed, and it
-works the way a debugger does (it watches and protects memory pages of the game). Every
-`VICTORY_...` switch the launcher sets can be overridden by setting it before running it.
+works the way a debugger does (it watches and protects memory pages of the game). Choose
+"More info" → "Run anyway".
+
+Advanced: every `VICTORY_...` switch can be set before starting it to override the built-in
+value; `VICTORY_GAME_DIR` points it at a dump in another folder. `Play-VIctory.cmd` in this
+repository does the same as a double-click, for those who prefer a script.
 
 ## Building from source
 
@@ -114,9 +121,10 @@ covered by the licence (see `docs/asset-policy.md` in the source).
 
 ## Resumen en español
 
-Versión de VIctory (capa que ejecuta un juego de Xbox Series en Windows con Direct3D 12)
-ajustada para **PCs normales: 16 GB de RAM, gráfica de 8 GB y CPU de 6 núcleos**, sin bajar la
-calidad gráfica (texturas, shaders, resolución y ray tracing intactos).
+Versión de VIctory (capa que ejecuta un juego de Xbox Series en Windows con Direct3D 12) que
+funciona **en cualquier PC desde 16 GB de RAM** (con 32 o 64 GB, más núcleos o mejor gráfica va
+más rápido), ajustada para que incluso un PC normal (16 GB, gráfica de 8 GB, 6 núcleos) pueda
+jugarlo, sin bajar la calidad gráfica (texturas, shaders, resolución y ray tracing intactos).
 
 - **No incluye nada del juego**: necesitas tu propio volcado (la carpeta con
   `game_scarlett_master.exe`).
@@ -124,8 +132,9 @@ calidad gráfica (texturas, shaders, resolución y ray tracing intactos).
   zonas cargadas 6–7 fps. Todavía no va fluido. En PCs más potentes debería ir mejor.
 - **Requisitos**: Windows 10/11 de 64 bits, CPU con AVX2, gráfica DirectX 12 con shader model
   6.6 y mesh shaders (NVIDIA RTX 20 o superior, AMD RX 6000 o superior, Intel Arc), 16 GB de RAM
-  como mínimo (32 GB recomendados) y un SSD.
-- **Uso**: descomprime el ZIP, pon tu volcado en una carpeta `game` junto a `Play-VIctory.cmd`
-  (o indica la ruta con `set VICTORY_GAME_DIR=D:\MiVolcado`) y ejecuta `Play-VIctory.cmd`. La
-  primera vez tarda más porque prepara la caché de shaders.
-- Windows o el antivirus pueden avisar porque el `.exe` no está firmado.
+  o más y un SSD.
+- **Uso**: descarga `victory.exe` de Releases, ponlo en la carpeta de tu volcado (junto a
+  `game_scarlett_master.exe`) y ábrelo con doble clic. Nada más. La primera vez tarda porque
+  prepara la caché de shaders; deja abierta la ventana de consola mientras juegas.
+- Windows o el antivirus pueden avisar porque el `.exe` no está firmado: "Más información" →
+  "Ejecutar de todas formas".

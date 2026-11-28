@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod easy;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -168,6 +169,10 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Opened with nothing after its name (a double click): the title beside it.
+    if easy::wanted() {
+        return easy::run();
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
