@@ -6,7 +6,7 @@ Xbox Series title natively on Windows (Direct3D 12) from files the user supplies
 and it was tuned so that even an ordinary PC (16 GB, an 8 GB card, 6 cores) can play it, without
 lowering the picture: textures, shaders, resolution and ray tracing stay as they are.
 
-**To play: put `victory.exe` in the folder of your game dump and double-click it.**
+**To play: put `VIctory-Dn0nex.exe` in the folder of your game dump and double-click it.**
 
 > **This repository and its releases contain no game files, code or assets.**
 > You need your own dump of the game. This project is not affiliated with or endorsed by
@@ -26,7 +26,7 @@ It runs, but it is **not smooth yet**. Tested on one mid-range PC (6-core CPU, 8
 | Busy views | 6–7 fps |
 | Memory | stays inside 16 GB RAM / 8 GB VRAM |
 
-Faster PCs (more cores, 32 or 64 GB of RAM, a stronger card) do better: `victory.exe` detects
+Faster PCs (more cores, 32 or 64 GB of RAM, a stronger card) do better: `VIctory-Dn0nex.exe` detects
 the number of CPU threads and the amount of RAM and uses more threads and memory when there are.
 
 Known problems (from upstream and this build):
@@ -48,7 +48,7 @@ Known problems (from upstream and this build):
 - **Settings built in, chosen for the PC it runs on**: windows of game memory kept on the card,
   finer windows, card-side steps instead of waits; fewer threads on 6-core CPUs, more on 8-core
   ones, more memory used in place with 32 GB or more.
-- **Double-click start**: `victory.exe` with no arguments finds the game in its own folder and
+- **Double-click start**: `VIctory-Dn0nex.exe` with no arguments finds the game in its own folder and
   starts it, no launcher needed.
 
 Everything else (the loader, the runtime, the D3D12 back end, the shader recompiler, the
@@ -66,15 +66,15 @@ threaded translation, landings and card steps) comes from the projects in the cr
 
 ## How to run it
 
-1. Download `victory.exe` from [Releases](../../releases/latest).
+1. Download `VIctory-Dn0nex.exe` from [Releases](../../releases/latest).
 2. Put it in the folder of your game dump, next to `game_scarlett_master.exe`.
-3. Double-click `victory.exe`.
+3. Double-click `VIctory-Dn0nex.exe`.
 
 That is all. The first start takes a while (shaders are prepared and cached in
 `%LOCALAPPDATA%\victory\cache`); keep the console window open while you play. The log of each
-run goes to `victory-run.log` next to `victory.exe`.
+run goes to `victory-run.log` next to `VIctory-Dn0nex.exe`.
 
-Windows SmartScreen or an antivirus may warn about `victory.exe`: it is not signed, and it
+Windows SmartScreen or an antivirus may warn about `VIctory-Dn0nex.exe`: it is not signed, and it
 works the way a debugger does (it watches and protects memory pages of the game). Choose
 "More info" → "Run anyway".
 
@@ -133,7 +133,7 @@ jugarlo, sin bajar la calidad gráfica (texturas, shaders, resolución y ray tra
 - **Requisitos**: Windows 10/11 de 64 bits, CPU con AVX2, gráfica DirectX 12 con shader model
   6.6 y mesh shaders (NVIDIA RTX 20 o superior, AMD RX 6000 o superior, Intel Arc), 16 GB de RAM
   o más y un SSD.
-- **Uso**: descarga `victory.exe` de Releases, ponlo en la carpeta de tu volcado (junto a
+- **Uso**: descarga `VIctory-Dn0nex.exe` de Releases, ponlo en la carpeta de tu volcado (junto a
   `game_scarlett_master.exe`) y ábrelo con doble clic. Nada más. La primera vez tarda porque
   prepara la caché de shaders; deja abierta la ventana de consola mientras juegas.
 - Windows o el antivirus pueden avisar porque el `.exe` no está firmado: "Más información" →

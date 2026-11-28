@@ -1,4 +1,4 @@
-//! Double-click start: `victory.exe` opened with no arguments, from the
+//! Double-click start: the executable (`victory.exe`, `VIctory-Dn0nex.exe`) opened with no arguments, from the
 //! folder of the user's own dump of the title (or with `VICTORY_GAME_DIR`
 //! set), starts the title with the settings `Play-VIctory.cmd` gives.
 //!
@@ -142,9 +142,10 @@ pub(crate) fn run() -> Result<()> {
     let me = std::env::current_exe().context("where this executable is")?;
     let here = me.parent().map(Path::to_path_buf).unwrap_or_default();
     let Some(title) = find_title(&here) else {
+        let name = me.file_name().map_or_else(|| "this program".into(), |n| n.to_string_lossy().into_owned());
         println!("VIctory: {TITLE} was not found.");
         println!();
-        println!("Put victory.exe in the folder of your own dump of the game (the folder that");
+        println!("Put {name} in the folder of your own dump of the game (the folder that");
         println!("holds {TITLE}) and open it again, or set VICTORY_GAME_DIR to that folder.");
         wait_for_enter();
         std::process::exit(2);
